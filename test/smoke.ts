@@ -6,7 +6,7 @@ import {
   GetUsableModelsResponseSchema,
   ModelDetailsSchema,
 } from "../src/proto/agent_pb";
-import { Credential, Integration, Model, Provider } from "@opencode-ai/plugin";
+import { Credential, Integration } from "@opencode/plugin";
 import type CursorV2PluginModule from "../src/v2";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
@@ -29,8 +29,8 @@ type IntegrationTransform = Parameters<
 >[0];
 type IntegrationDraft = Parameters<IntegrationTransform>[0];
 type IntegrationMethod = Parameters<IntegrationDraft["method"]["update"]>[0];
-type CatalogTransform = Parameters<V2Context["catalog"]["transform"]>[0];
-type CatalogDraft = Parameters<CatalogTransform>[0];
+type ProviderTransform = Parameters<V2Context["provider"]["transform"]>[0];
+type ProviderEditor = Parameters<ProviderTransform>[0];
 
 interface TestCursorBackend {
   apiUrl: string;
@@ -389,8 +389,9 @@ async function testV2Plugin(
   ]);
 
   let integrationTransform: IntegrationTransform | undefined;
-  let catalogTransform: CatalogTransform | undefined;
+  let providerTransform: ProviderTransform | undefined;
   let authMethod: IntegrationMethod | undefined;
+  const registeredMethods: IntegrationMethod[] = [];
   let integrationName: string | undefined;
   let providerPackage: string | undefined;
   let providerIntegrationID: string | undefined;
@@ -416,48 +417,32 @@ async function testV2Plugin(
         return [];
       },
       update(method) {
-        authMethod = method;
+        registeredMethods.push(method);
+        if (method.method.type === "oauth") authMethod = method;
       },
       remove() {},
     },
   };
 
-  const catalogDraft: CatalogDraft = {
-    provider: {
-      list() {
-        return [];
-      },
-      get() {
-        return undefined;
-      },
-      update(id, update) {
-        const provider = Provider.Info.empty(Provider.ID.make(id));
-        update(provider);
-        providerPackage = provider.package;
-        providerIntegrationID = provider.integrationID;
-        providerBaseURL = provider.settings?.baseURL;
-      },
-      remove() {},
+  const providerEditor: ProviderEditor = {
+    list() {
+      return [];
     },
-    model: {
-      get() {
-        return undefined;
-      },
-      update(providerID, modelID, update) {
-        const model = Model.Info.default(
-          Provider.ID.make(providerID),
-          Model.ID.make(modelID),
-        );
-        update(model);
-        modelIDs.push(model.id);
-      },
+    get() {
+      return undefined;
+    },
+    add(input) {
+      providerPackage = input.info.package;
+      providerIntegrationID = input.info.integrationID;
+      providerBaseURL = input.info.settings?.baseURL;
+      modelIDs.push(...input.models.map((model) => model.id));
+    },
+    update() {},
+    remove() {},
+    models: {
+      set() {},
+      update() {},
       remove() {},
-      default: {
-        get() {
-          return undefined;
-        },
-        set() {},
-      },
     },
   };
 
@@ -469,7 +454,7 @@ async function testV2Plugin(
     return Promise.race([
       pending.promise,
       Bun.sleep(500).then(() => {
-        throw new Error("Expected V2 catalog reload");
+        throw new Error("Expected V2 provider reload");
       }),
     ]);
   }
@@ -557,20 +542,20 @@ async function testV2Plugin(
         },
       },
     },
-    catalog: {
-      async transform(transform: CatalogTransform) {
-        catalogTransform = transform;
+    provider: {
+      async transform(transform: ProviderTransform) {
+        providerTransform = transform;
         return { async dispose() {} };
       },
       async reload() {
         modelIDs.length = 0;
-        assert(catalogTransform, "Expected V2 catalog transform");
-        catalogTransform(catalogDraft);
+        assert(providerTransform, "Expected V2 provider transform");
+        providerTransform(providerEditor);
         markReload?.();
         markReload = undefined;
         if (failReload) {
           failReload = false;
-          throw new Error("Injected catalog reload failure");
+          throw new Error("Injected provider reload failure");
         }
       },
     },
@@ -581,7 +566,7 @@ async function testV2Plugin(
     },
   };
 
-  // SAFETY: The plugin only reads the integration, catalog, and event domains
+  // SAFETY: The plugin only reads the integration, provider, and event domains
   // supplied by this public-entrypoint harness.
   const cleanup = await modules.CursorV2Plugin.setup(
     context as unknown as V2Context,
@@ -625,8 +610,20 @@ async function testV2Plugin(
   );
   assertEqual(
     providerPackage,
-    "@opencode-ai/ai/providers/openai-compatible",
+    "@opencode/ai/providers/openai-compatible",
     "Expected V2 OpenAI-compatible provider",
+  );
+  assert(
+    registeredMethods.some((method) => method.method.type === "key"),
+    "Expected Cursor API key method",
+  );
+  assert(
+    registeredMethods.some(
+      (method) =>
+        method.method.type === "env" &&
+        method.method.names.includes("CURSOR_API_KEY"),
+    ),
+    "Expected CURSOR_API_KEY env method",
   );
   assert(
     typeof providerBaseURL === "string",
@@ -635,7 +632,7 @@ async function testV2Plugin(
   assertArrayEqual(
     modelIDs.sort(),
     ["auto", "v2-model"],
-    "Expected V2 catalog models",
+    "Expected V2 provider models",
   );
 
   const modelsResponse = await fetch(`${providerBaseURL}/models`);
@@ -860,6 +857,210 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testV2ApiKey(modules: TestModules) {
+  console.log("[test] Checking V2 Cursor API key auth...");
+  modules.clearModelCache();
+  modules.stopProxy();
+
+  const meAuthHeaders: string[] = [];
+  const acceptedKey = "crsr_test";
+  const cloudServer = http.createServer((req, res) => {
+    const auth = req.headers.authorization ?? "";
+    const basic = (key: string) =>
+      auth === `Basic ${Buffer.from(`${key}:`).toString("base64")}`;
+    const authorized = basic(acceptedKey);
+    if (req.url === "/v1/me") {
+      meAuthHeaders.push(auth);
+      if (!authorized) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized", message: "Invalid API key" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ apiKeyName: "opencode", userEmail: "dev@example.com" }));
+      return;
+    }
+    if (req.url === "/v1/models") {
+      if (!authorized) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized", message: "Invalid API key" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          items: [
+            { id: "composer-2", displayName: "Composer 2" },
+            { id: "claude-4.6-sonnet-thinking", displayName: "Claude 4.6 Sonnet (Thinking)" },
+          ],
+        }),
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve) => cloudServer.listen(0, "127.0.0.1", resolve));
+  const cloudPort = (cloudServer.address() as AddressInfo).port;
+  process.env.CURSOR_CLOUD_API_URL = `http://127.0.0.1:${cloudPort}`;
+
+  const modelIDs: string[] = [];
+  const statuses: string[] = [];
+  let providerTransform: ProviderTransform | undefined;
+  let markReload: (() => void) | undefined;
+  function waitForReload(): Promise<void> {
+    const pending = Promise.withResolvers<void>();
+    markReload = pending.resolve;
+    return pending.promise;
+  }
+
+  let eventClosed = false;
+  const eventQueue: Array<{ type: string; data: { integrationID: string } }> = [];
+  let sendEvent: ((result: IteratorResult<{ type: string; data: { integrationID: string } }>) => void) | undefined;
+  const eventStream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<{ type: string; data: { integrationID: string } }>> {
+          if (eventClosed) return Promise.resolve({ done: true, value: undefined });
+          const event = eventQueue.shift();
+          if (event) return Promise.resolve({ done: false, value: event });
+          return new Promise((resolve) => {
+            sendEvent = resolve;
+          });
+        },
+        return(): Promise<IteratorResult<{ type: string; data: { integrationID: string } }>> {
+          eventClosed = true;
+          sendEvent?.({ done: true, value: undefined });
+          sendEvent = undefined;
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+
+  function contextFor(key: string) {
+    const connection = {
+      type: "credential" as const,
+      id: "cursor-key",
+      label: "Cursor API key",
+      method: "key" as const,
+    };
+    return {
+      integration: {
+        async transform(transform: IntegrationTransform) {
+          transform({
+            list: () => [{ id: "cursor", name: "cursor" }],
+            get: (id: string) => (id === "cursor" ? { id: "cursor", name: "cursor" } : undefined),
+            update: (_id: string, update: (integration: { id: string; name: string }) => void) => {
+              update({ id: "cursor", name: "cursor" });
+            },
+            remove() {},
+            method: { list: () => [], update() {}, remove() {} },
+          });
+          return { async dispose() {} };
+        },
+        async reload() {},
+        connection: {
+          async active() {
+            return connection;
+          },
+          async resolve() {
+            return { type: "key" as const, key };
+          },
+          async status(input: { status?: { status?: string } }) {
+            if (input.status?.status) statuses.push(input.status.status);
+          },
+        },
+      },
+      provider: {
+        async transform(transform: ProviderTransform) {
+          providerTransform = transform;
+          return { async dispose() {} };
+        },
+        async reload() {
+          modelIDs.length = 0;
+          providerTransform?.({
+            list: () => [],
+            get: () => undefined,
+            add(input) {
+              modelIDs.push(...input.models.map((model) => model.id));
+            },
+            update() {},
+            remove() {},
+            models: { set() {}, update() {}, remove() {} },
+          });
+          markReload?.();
+          markReload = undefined;
+        },
+      },
+      event: { subscribe: () => eventStream },
+    };
+  }
+
+  try {
+    const rejected = await modules.CursorV2Plugin.setup(
+      contextFor("crsr_rejected") as unknown as V2Context,
+    );
+    assert(typeof rejected === "function", "Expected rejected-key cleanup");
+    await rejected();
+    assertArrayEqual(
+      meAuthHeaders.slice(0, 2),
+      ["Bearer crsr_rejected", `Basic ${Buffer.from("crsr_rejected:").toString("base64")}`],
+      "Expected API key check to try Bearer, then Basic",
+    );
+    assertArrayEqual(statuses, ["needs_auth"], "Expected a rejected API key to need auth");
+    assertEqual(modelIDs.length, 0, "Expected a rejected API key to register no models");
+
+    meAuthHeaders.length = 0;
+    statuses.length = 0;
+    eventClosed = false;
+    const accepted = await modules.CursorV2Plugin.setup(
+      contextFor(acceptedKey) as unknown as V2Context,
+    );
+    const loaded = waitForReload();
+    const switched = {
+      type: "credential.switched",
+      data: { integrationID: "cursor" },
+    };
+    if (sendEvent) {
+      const send = sendEvent;
+      sendEvent = undefined;
+      send({ done: false, value: switched });
+    } else {
+      eventQueue.push(switched);
+    }
+    await loaded;
+    assertArrayEqual(
+      meAuthHeaders.slice(0, 2),
+      [
+        `Bearer ${acceptedKey}`,
+        `Basic ${Buffer.from(`${acceptedKey}:`).toString("base64")}`,
+      ],
+      "Expected a valid API key to fall back from Bearer to Basic",
+    );
+    assertArrayEqual(
+      modelIDs.sort(),
+      ["auto", "claude-4.6-sonnet-thinking", "composer-2"],
+      "Expected models from GET /v1/models",
+    );
+    assert(
+      modelIDs.includes("claude-4.6-sonnet-thinking"),
+      "Expected thinking models to stay addressable",
+    );
+    assertEqual(modules.getProxyPort() === undefined, false, "Expected the API key to start the proxy");
+    assert(typeof accepted === "function", "Expected API key cleanup");
+    await accepted();
+    assert(eventClosed, "Expected API key cleanup to close the event stream");
+    console.log("[test] V2 Cursor API key auth OK");
+  } finally {
+    delete process.env.CURSOR_CLOUD_API_URL;
+    modules.stopProxy();
+    await new Promise<void>((resolve, reject) =>
+      cloudServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -876,6 +1077,7 @@ async function main() {
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
     await testV2Plugin(modules, backend);
+    await testV2ApiKey(modules);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

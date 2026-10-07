@@ -1,10 +1,21 @@
-import { Credential, Integration, Model, Plugin } from "@opencode-ai/plugin";
+import {
+  Connection,
+  Credential,
+  Integration,
+  Model,
+  Plugin,
+  Provider,
+} from "@opencode/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
   pollCursorAuth,
   refreshCursorToken,
 } from "./auth";
+import {
+  accessTokenForCursorApiKey,
+  listCursorCloudModels,
+} from "./cursor-api";
 import {
   clearModelCache,
   getCursorModels,
@@ -15,13 +26,17 @@ import { startProxy, stopProxy } from "./proxy";
 const CURSOR_ID = "cursor";
 const CURSOR_INTEGRATION_ID = Integration.ID.make(CURSOR_ID);
 const CURSOR_METHOD_ID = Integration.MethodID.make("cursor-oauth");
-const OPENAI_COMPATIBLE_PACKAGE =
-  "@opencode-ai/ai/providers/openai-compatible";
+const OPENAI_COMPATIBLE_PACKAGE = "@opencode/ai/providers/openai-compatible";
 
 interface CatalogState {
   readonly models: CursorModel[];
   readonly port: number;
+  readonly connection?: Connection.Info;
 }
+
+type ResolvedAuth =
+  | { readonly kind: "oauth"; readonly access: string }
+  | { readonly kind: "api"; readonly key: string; readonly access: string };
 
 const CursorV2Plugin = Plugin.define({
   id: "opencode.cursor-oauth",
@@ -67,50 +82,65 @@ const CursorV2Plugin = Plugin.define({
           });
         },
       });
+      draft.method.update({
+        integrationID: CURSOR_INTEGRATION_ID,
+        method: {
+          type: "key",
+          label: "Cursor API key",
+        },
+      });
+      draft.method.update({
+        integrationID: CURSOR_INTEGRATION_ID,
+        method: {
+          type: "env",
+          names: ["CURSOR_API_KEY"],
+        },
+      });
     });
-    // Setup batches transforms, so apply OAuth refresh before loading the catalog.
+    // Setup batches transforms, so apply auth before loading providers.
     await ctx.integration.reload();
 
     let catalog = await loadCatalog(ctx);
-    await ctx.catalog.transform((draft) => {
+    await ctx.provider.transform((editor) => {
       const current = catalog;
       if (!current) return;
 
-      draft.provider.update(CURSOR_ID, (provider) => {
-        provider.integrationID = CURSOR_INTEGRATION_ID;
-        provider.name = "Cursor";
-        provider.activation = "auto";
-        provider.package = OPENAI_COMPATIBLE_PACKAGE;
-        provider.settings = {
-          ...provider.settings,
-          baseURL: `http://localhost:${current.port}/v1`,
-        };
-      });
-
-      for (const cursorModel of current.models) {
-        draft.model.update(CURSOR_ID, cursorModel.id, (model) => {
-          model.modelID = Model.ID.make(cursorModel.id);
-          model.name = cursorModel.name;
-          model.capabilities = {
+      const providerID = Provider.ID.make(CURSOR_ID);
+      editor.add({
+        info: {
+          ...Provider.Info.empty(providerID),
+          integrationID: CURSOR_INTEGRATION_ID,
+          name: "Cursor",
+          activation: "auto",
+          package: OPENAI_COMPATIBLE_PACKAGE,
+          settings: {
+            baseURL: `http://localhost:${current.port}/v1`,
+          },
+        },
+        models: current.models.map((cursorModel) => ({
+          ...Model.Info.default(providerID, Model.ID.make(cursorModel.id)),
+          name: cursorModel.name,
+          capabilities: {
             tools: true,
             input: ["text"],
             output: ["text"],
-          };
-          model.limit = {
+          },
+          limit: {
             context: cursorModel.contextWindow,
             output: cursorModel.maxTokens,
-          };
-          model.status = "active";
-          model.enabled = true;
-        });
-      }
+          },
+          status: "active",
+          enabled: true,
+        })),
+        sourceConnection: current.connection as Connection.Info | undefined,
+      });
     });
 
     const stopWatching = watchConnections(ctx, async () => {
       clearModelCache();
       catalog = await loadCatalog(ctx);
       if (!catalog) stopProxy();
-      await ctx.catalog.reload();
+      await ctx.provider.reload();
     });
 
     return async () => {
@@ -129,24 +159,80 @@ async function loadCatalog(
   ctx: Plugin.Context,
 ): Promise<CatalogState | undefined> {
   try {
-    const accessToken = await getAccessToken(ctx);
-    const models = await getCursorModels(accessToken);
-    const port = await startProxy(() => getAccessToken(ctx), models);
-    return { models, port };
-  } catch {
+    const auth = await resolveAuth(ctx);
+    const connection = await ctx.integration.connection.active(CURSOR_ID);
+    const models = await loadModels(auth);
+    const port = await startProxy(() => resolveAccessToken(ctx), models);
+    return {
+      models,
+      port,
+      connection: connection as Connection.Info | undefined,
+    };
+  } catch (error) {
+    await reportAuthFailure(ctx, error);
     return undefined;
   }
 }
 
-async function getAccessToken(ctx: Plugin.Context): Promise<string> {
+async function loadModels(auth: ResolvedAuth): Promise<CursorModel[]> {
+  if (auth.kind === "api") {
+    const cloudModels = await listCursorCloudModels(auth.key);
+    if (cloudModels && cloudModels.length > 0) return cloudModels;
+  }
+  return getCursorModels(auth.access);
+}
+
+async function resolveAccessToken(ctx: Plugin.Context): Promise<string> {
+  const auth = await resolveAuth(ctx);
+  return auth.access;
+}
+
+async function resolveAuth(ctx: Plugin.Context): Promise<ResolvedAuth> {
   const connection = await ctx.integration.connection.active(CURSOR_ID);
   if (!connection) throw new Error("Cursor auth not configured");
 
-  const credential = await ctx.integration.connection.resolve(connection);
-  if (!credential || credential.type !== "oauth") {
-    throw new Error("Cursor auth not configured");
+  if (connection.type === "env") {
+    const key = process.env[connection.name]?.trim();
+    if (!key) throw new Error("Cursor auth not configured");
+    return {
+      kind: "api",
+      key,
+      access: await accessTokenForCursorApiKey(key),
+    };
   }
-  return credential.access;
+
+  const credential = await ctx.integration.connection.resolve(connection);
+  if (!credential) throw new Error("Cursor auth not configured");
+  if (credential.type === "oauth") {
+    if (!credential.access) throw new Error("Cursor auth not configured");
+    return { kind: "oauth", access: credential.access };
+  }
+  const key = credential.key.trim();
+  if (!key) throw new Error("Cursor auth not configured");
+  return {
+    kind: "api",
+    key,
+    access: await accessTokenForCursorApiKey(key),
+  };
+}
+
+async function reportAuthFailure(
+  ctx: Plugin.Context,
+  error: unknown,
+): Promise<void> {
+  const message = error instanceof Error ? error.message : "Cursor authentication failed";
+  if (!message.includes("rejected") && !message.includes("check failed")) return;
+  const connection = await ctx.integration.connection
+    .active(CURSOR_ID)
+    .catch(() => undefined);
+  if (!connection) return;
+  await ctx.integration.connection
+    .status({
+      integrationID: CURSOR_ID,
+      connection,
+      status: { status: "needs_auth", message },
+    })
+    .catch(() => {});
 }
 
 function watchConnections(
@@ -159,11 +245,7 @@ function watchConnections(
       while (true) {
         const next = await events.next();
         if (next.done) return;
-        const event = next.value;
-        if (
-          event.type === "integration.connection.updated" &&
-          event.data.integrationID === CURSOR_ID
-        ) {
+        if (isCursorAuthEvent(next.value)) {
           await refresh().catch(() => {});
         }
       }
@@ -174,4 +256,19 @@ function watchConnections(
     await events.return?.();
     await watcher;
   };
+}
+
+function isCursorAuthEvent(event: { type?: string; data?: unknown }): boolean {
+  const integrationID = integrationIdFromEvent(event);
+  return (
+    (event.type === "credential.switched" ||
+      event.type === "integration.connection.updated") &&
+    integrationID === CURSOR_ID
+  );
+}
+
+function integrationIdFromEvent(event: { data?: unknown }): string | undefined {
+  if (!event.data || typeof event.data !== "object") return undefined;
+  const integrationID = (event.data as { integrationID?: unknown }).integrationID;
+  return typeof integrationID === "string" ? integrationID : undefined;
 }

@@ -1,7 +1,7 @@
 {
   "name": "opencode-cursor-oauth",
-  "version": "0.2.0",
-  "description": "OpenCode plugin that connects Cursor's API to OpenCode via OAuth, model discovery, and a local OpenAI-compatible proxy.",
+  "version": "0.3.0",
+  "description": "OpenCode plugin that connects Cursor's API to OpenCode via API key or OAuth, model discovery, and a local OpenAI-compatible proxy.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -29,11 +29,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ephraimduncan/opencode-cursor.git"
+    "url": "git+https://github.com/peakpowerenergy/opencode-cursor.git"
   },
-  "homepage": "https://github.com/ephraimduncan/opencode-cursor#readme",
+  "homepage": "https://github.com/peakpowerenergy/opencode-cursor#readme",
   "bugs": {
-    "url": "https://github.com/ephraimduncan/opencode-cursor/issues"
+    "url": "https://github.com/peakpowerenergy/opencode-cursor/issues"
   },
   "keywords": [
     "opencode",
@@ -48,10 +48,14 @@
   "publishConfig": {
     "access": "public"
   },
+  "overrides": {
+    "@opencode-ai/sdk": "1.18.9"
+  },
   "dependencies": {
     "@bufbuild/protobuf": "^2.0.0",
     "@opencode-ai/plugin": "0.0.0-beta-17793",
-    "@opencode-ai/sdk": "^1.18.9",
+    "@opencode-ai/sdk": "1.18.9",
+    "@opencode/plugin": "2.0.24",
     "zod": "^3.24.0"
   },
   "devDependencies": {

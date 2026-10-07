@@ -109,8 +109,33 @@ export async function getCursorModels(
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
   const models = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  cachedModels = models.some((m) => m.id === AUTO_MODEL.id) ? models : [AUTO_MODEL, ...models];
+  cachedModels = withAutoModel(models);
   return cachedModels;
+}
+
+export function cursorModelsFromCloudItems(
+  items: readonly { id?: string; displayName?: string }[],
+): CursorModel[] {
+  const byId = new Map<string, CursorModel>();
+  for (const item of items) {
+    const id = item.id?.trim();
+    if (!id) continue;
+    const name = item.displayName?.trim() || id;
+    byId.set(id, {
+      id,
+      name,
+      reasoning: /thinking|reason/i.test(`${id} ${name}`),
+      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      maxTokens: DEFAULT_MAX_TOKENS,
+    });
+  }
+  return withAutoModel([...byId.values()].sort((a, b) => a.id.localeCompare(b.id)));
+}
+
+function withAutoModel(models: readonly CursorModel[]): CursorModel[] {
+  return models.some((model) => model.id === AUTO_MODEL.id)
+    ? [...models]
+    : [AUTO_MODEL, ...models];
 }
 
 /** @internal Test-only. */

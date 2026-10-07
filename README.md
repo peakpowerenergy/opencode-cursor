@@ -3,7 +3,7 @@
 OpenCode plugin that connects to Cursor's API, giving you access to Cursor
 models inside OpenCode with full tool-calling support.
 
-## OpenCode V2 beta
+## OpenCode 2
 
 Install the plugin:
 
@@ -11,13 +11,17 @@ Install the plugin:
 opencode2 plugin add opencode-cursor-oauth
 ```
 
-The command adds the package to your global V2 configuration.
+The command adds the package to your global configuration.
 
 Start `opencode2`.
 Run `/connect`.
 Select Cursor.
 
-The plugin adds Cursor OAuth and the available models to the V2 catalog.
+You can sign in with a Cursor API key or with browser login. API keys are created in the [Cursor dashboard](https://cursor.com/dashboard). The key looks like `crsr_...`. The plugin checks it with `GET https://api.cursor.com/v1/me`, sending the key as a bearer token and retrying with basic auth (the key as the username and an empty password) when that request is unauthorized. That matches the [Cursor API authentication docs](https://cursor.com/docs/api).
+
+`CURSOR_API_KEY` is picked up on its own when that variable is set.
+
+The plugin registers the Cursor provider and the models returned by `GET /v1/models`.
 
 You can also add the package directly to `opencode.jsonc`:
 
@@ -60,8 +64,8 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 
 ## How it works
 
-1. OAuth — browser-based login to Cursor via PKCE.
-2. Model discovery — queries Cursor's gRPC API for all available models.
+1. Auth — a Cursor API key (`GET /v1/me`) or browser OAuth via PKCE.
+2. Model discovery — `GET /v1/models` for API keys, and Cursor's gRPC model list for OAuth sessions.
 3. Local proxy — translates `POST /v1/chat/completions` into Cursor's
    protobuf/HTTP/2 Connect protocol.
 4. Native tool routing — redirects Cursor's built-in filesystem/shell tools
